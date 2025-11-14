@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -229,8 +230,32 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 	return fmt.Sprintf("http://127.0.0.1:%d%s", h.cfg.Port, path), nil
 }
 
-// List auth files
 func (h *Handler) ListAuthFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		h.listAuthFilesFromDisk(c)
+		return
+	}
+	auths := h.authManager.List()
+	files := make([]gin.H, 0, len(auths))
+	for _, auth := range auths {
+		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			files = append(files, entry)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(200, gin.H{"files": files})
+}
+
+// List auth files from disk when the auth manager is unavailable.
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -261,6 +286,106 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		}
 	}
 	c.JSON(200, gin.H{"files": files})
+}
+
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	if auth == nil {
+		return nil
+	}
+	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		return nil
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" && !runtimeOnly {
+		return nil
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = auth.ID
+	}
+	entry := gin.H{
+		"id":             auth.ID,
+		"name":           name,
+		"type":           strings.TrimSpace(auth.Provider),
+		"provider":       strings.TrimSpace(auth.Provider),
+		"label":          auth.Label,
+		"status":         auth.Status,
+		"status_message": auth.StatusMessage,
+		"disabled":       auth.Disabled,
+		"unavailable":    auth.Unavailable,
+		"runtime_only":   runtimeOnly,
+		"source":         "memory",
+		"size":           int64(0),
+	}
+	if email := authEmail(auth); email != "" {
+		entry["email"] = email
+	}
+	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+		if accountType != "" {
+			entry["account_type"] = accountType
+		}
+		if account != "" {
+			entry["account"] = account
+		}
+	}
+	if !auth.CreatedAt.IsZero() {
+		entry["created_at"] = auth.CreatedAt
+	}
+	if !auth.UpdatedAt.IsZero() {
+		entry["modtime"] = auth.UpdatedAt
+		entry["updated_at"] = auth.UpdatedAt
+	}
+	if !auth.LastRefreshedAt.IsZero() {
+		entry["last_refresh"] = auth.LastRefreshedAt
+	}
+	if path != "" {
+		entry["path"] = path
+		entry["source"] = "file"
+		if info, err := os.Stat(path); err == nil {
+			entry["size"] = info.Size()
+			entry["modtime"] = info.ModTime()
+		} else if os.IsNotExist(err) {
+			entry["source"] = "memory"
+		} else {
+			log.WithError(err).Warnf("failed to stat auth file %s", path)
+		}
+	}
+	return entry
+}
+
+func authEmail(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["email"].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["email"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(auth.Attributes["account_email"]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func authAttribute(auth *coreauth.Auth, key string) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	return auth.Attributes[key]
+}
+
+func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
 }
 
 // Download single auth file by name
@@ -383,6 +508,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				}
 			}
 			if err = os.Remove(full); err == nil {
+				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+					c.JSON(500, gin.H{"error": errDel.Error()})
+					return
+				}
 				deleted++
 				h.disableAuth(ctx, full)
 			}
@@ -409,8 +538,30 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		}
 		return
 	}
+	if err := h.deleteTokenRecord(ctx, full); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
 	h.disableAuth(ctx, full)
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (h *Handler) authIDForPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if h == nil || h.cfg == nil {
+		return path
+	}
+	authDir := strings.TrimSpace(h.cfg.AuthDir)
+	if authDir == "" {
+		return path
+	}
+	if rel, err := filepath.Rel(authDir, path); err == nil && rel != "" {
+		return rel
+	}
+	return path
 }
 
 func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []byte) error {
@@ -441,13 +592,18 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 
+	authID := h.authIDForPath(path)
+	if authID == "" {
+		authID = path
+	}
 	attr := map[string]string{
 		"path":   path,
 		"source": path,
 	}
 	auth := &coreauth.Auth{
-		ID:         path,
+		ID:         authID,
 		Provider:   provider,
+		FileName:   filepath.Base(path),
 		Label:      label,
 		Status:     coreauth.StatusActive,
 		Attributes: attr,
@@ -458,7 +614,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
-	if existing, ok := h.authManager.GetByID(path); ok {
+	if existing, ok := h.authManager.GetByID(authID); ok {
 		auth.CreatedAt = existing.CreatedAt
 		if !hasLastRefresh {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
@@ -473,10 +629,17 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {
-	if h.authManager == nil || id == "" {
+	if h == nil || h.authManager == nil {
 		return
 	}
-	if auth, ok := h.authManager.GetByID(id); ok {
+	authID := h.authIDForPath(id)
+	if authID == "" {
+		authID = strings.TrimSpace(id)
+	}
+	if authID == "" {
+		return
+	}
+	if auth, ok := h.authManager.GetByID(authID); ok {
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
@@ -485,9 +648,20 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
-func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
-	if record == nil {
-		return "", fmt.Errorf("token record is nil")
+func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("auth path is empty")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
+	}
+	return store.Delete(ctx, path)
+}
+
+func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
+	if h == nil {
+		return nil
 	}
 	store := h.tokenStore
 	if store == nil {
@@ -498,6 +672,17 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
+	}
+	return store
+}
+
+func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	if record == nil {
+		return "", fmt.Errorf("token record is nil")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return "", fmt.Errorf("token store unavailable")
 	}
 	return store.Save(ctx, record)
 }
@@ -846,29 +1031,46 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 		fmt.Println("Authentication successful.")
 
-		if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
-			log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-			oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
-			return
-		}
+		if strings.EqualFold(requestedProjectID, "ALL") {
+			ts.Auto = false
+			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
+			if errAll != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
+				oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
+				return
+			}
+			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
+				oauthStatus[state] = "Failed to verify Cloud AI API status"
+				return
+			}
+			ts.ProjectID = strings.Join(projects, ",")
+			ts.Checked = true
+		} else {
+			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
+				oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
+				return
+			}
 
-		if strings.TrimSpace(ts.ProjectID) == "" {
-			log.Error("Onboarding did not return a project ID")
-			oauthStatus[state] = "Failed to resolve project ID"
-			return
-		}
+			if strings.TrimSpace(ts.ProjectID) == "" {
+				log.Error("Onboarding did not return a project ID")
+				oauthStatus[state] = "Failed to resolve project ID"
+				return
+			}
 
-		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-		if errCheck != nil {
-			log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-			oauthStatus[state] = "Failed to verify Cloud AI API status"
-			return
-		}
-		ts.Checked = isChecked
-		if !isChecked {
-			log.Error("Cloud AI API is not enabled for the selected project")
-			oauthStatus[state] = "Cloud AI API not enabled"
-			return
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				oauthStatus[state] = "Failed to verify Cloud AI API status"
+				return
+			}
+			ts.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the selected project")
+				oauthStatus[state] = "Cloud AI API not enabled"
+				return
+			}
 		}
 
 		recordMetadata := map[string]any{
@@ -878,10 +1080,11 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			"checked":    ts.Checked,
 		}
 
+		fileName := geminiAuth.CredentialFileName(ts.Email, ts.ProjectID, true)
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("gemini-%s-%s.json", ts.Email, ts.ProjectID),
+			ID:       fileName,
 			Provider: "gemini",
-			FileName: fmt.Sprintf("gemini-%s-%s.json", ts.Email, ts.ProjectID),
+			FileName: fileName,
 			Storage:  &ts,
 			Metadata: recordMetadata,
 		}
@@ -1271,6 +1474,57 @@ func ensureGeminiProjectAndOnboard(ctx context.Context, httpClient *http.Client,
 		storage.ProjectID = trimmedRequest
 	}
 
+	return nil
+}
+
+func onboardAllGeminiProjects(ctx context.Context, httpClient *http.Client, storage *geminiAuth.GeminiTokenStorage) ([]string, error) {
+	projects, errProjects := fetchGCPProjects(ctx, httpClient)
+	if errProjects != nil {
+		return nil, fmt.Errorf("fetch project list: %w", errProjects)
+	}
+	if len(projects) == 0 {
+		return nil, fmt.Errorf("no Google Cloud projects available for this account")
+	}
+	activated := make([]string, 0, len(projects))
+	seen := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		candidate := strings.TrimSpace(project.ProjectID)
+		if candidate == "" {
+			continue
+		}
+		if _, dup := seen[candidate]; dup {
+			continue
+		}
+		if err := performGeminiCLISetup(ctx, httpClient, storage, candidate); err != nil {
+			return nil, fmt.Errorf("onboard project %s: %w", candidate, err)
+		}
+		finalID := strings.TrimSpace(storage.ProjectID)
+		if finalID == "" {
+			finalID = candidate
+		}
+		activated = append(activated, finalID)
+		seen[candidate] = struct{}{}
+	}
+	if len(activated) == 0 {
+		return nil, fmt.Errorf("no Google Cloud projects available for this account")
+	}
+	return activated, nil
+}
+
+func ensureGeminiProjectsEnabled(ctx context.Context, httpClient *http.Client, projectIDs []string) error {
+	for _, pid := range projectIDs {
+		trimmed := strings.TrimSpace(pid)
+		if trimmed == "" {
+			continue
+		}
+		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, trimmed)
+		if errCheck != nil {
+			return fmt.Errorf("project %s: %w", trimmed, errCheck)
+		}
+		if !isChecked {
+			return fmt.Errorf("project %s: Cloud AI API not enabled", trimmed)
+		}
+	}
 	return nil
 }
 
