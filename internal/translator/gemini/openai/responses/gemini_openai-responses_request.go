@@ -10,6 +10,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
+
 func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := bytes.Clone(inputRawJSON)
 
@@ -65,39 +67,101 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				// even when the message.role is "user". We split such items into distinct Gemini messages
 				// with roles derived from the content type to match docs/convert-2.md.
 				if contentArray := item.Get("content"); contentArray.Exists() && contentArray.IsArray() {
+					currentRole := ""
+					var currentParts []string
+
+					flush := func() {
+						if currentRole == "" || len(currentParts) == 0 {
+							currentParts = nil
+							return
+						}
+						one := `{"role":"","parts":[]}`
+						one, _ = sjson.Set(one, "role", currentRole)
+						for _, part := range currentParts {
+							one, _ = sjson.SetRaw(one, "parts.-1", part)
+						}
+						out, _ = sjson.SetRaw(out, "contents.-1", one)
+						currentParts = nil
+					}
+
 					contentArray.ForEach(func(_, contentItem gjson.Result) bool {
 						contentType := contentItem.Get("type").String()
 						if contentType == "" {
 							contentType = "input_text"
 						}
+
+						effRole := "user"
+						if itemRole != "" {
+							switch strings.ToLower(itemRole) {
+							case "assistant", "model":
+								effRole = "model"
+							default:
+								effRole = strings.ToLower(itemRole)
+							}
+						}
+						if contentType == "output_text" {
+							effRole = "model"
+						}
+						if effRole == "assistant" {
+							effRole = "model"
+						}
+
+						if currentRole != "" && effRole != currentRole {
+							flush()
+							currentRole = ""
+						}
+						if currentRole == "" {
+							currentRole = effRole
+						}
+
+						var partJSON string
 						switch contentType {
 						case "input_text", "output_text":
 							if text := contentItem.Get("text"); text.Exists() {
-								effRole := "user"
-								if itemRole != "" {
-									switch strings.ToLower(itemRole) {
-									case "assistant", "model":
-										effRole = "model"
-									default:
-										effRole = strings.ToLower(itemRole)
+								partJSON = `{"text":""}`
+								partJSON, _ = sjson.Set(partJSON, "text", text.String())
+							}
+						case "input_image":
+							imageURL := contentItem.Get("image_url").String()
+							if imageURL == "" {
+								imageURL = contentItem.Get("url").String()
+							}
+							if imageURL != "" {
+								mimeType := "application/octet-stream"
+								data := ""
+								if strings.HasPrefix(imageURL, "data:") {
+									trimmed := strings.TrimPrefix(imageURL, "data:")
+									mediaAndData := strings.SplitN(trimmed, ";base64,", 2)
+									if len(mediaAndData) == 2 {
+										if mediaAndData[0] != "" {
+											mimeType = mediaAndData[0]
+										}
+										data = mediaAndData[1]
+									} else {
+										mediaAndData = strings.SplitN(trimmed, ",", 2)
+										if len(mediaAndData) == 2 {
+											if mediaAndData[0] != "" {
+												mimeType = mediaAndData[0]
+											}
+											data = mediaAndData[1]
+										}
 									}
 								}
-								if contentType == "output_text" {
-									effRole = "model"
+								if data != "" {
+									partJSON = `{"inline_data":{"mime_type":"","data":""}}`
+									partJSON, _ = sjson.Set(partJSON, "inline_data.mime_type", mimeType)
+									partJSON, _ = sjson.Set(partJSON, "inline_data.data", data)
 								}
-								if effRole == "assistant" {
-									effRole = "model"
-								}
-								one := `{"role":"","parts":[]}`
-								one, _ = sjson.Set(one, "role", effRole)
-								textPart := `{"text":""}`
-								textPart, _ = sjson.Set(textPart, "text", text.String())
-								one, _ = sjson.SetRaw(one, "parts.-1", textPart)
-								out, _ = sjson.SetRaw(out, "contents.-1", one)
 							}
+						}
+
+						if partJSON != "" {
+							currentParts = append(currentParts, partJSON)
 						}
 						return true
 					})
+
+					flush()
 				}
 
 			case "function_call":
@@ -108,6 +172,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				modelContent := `{"role":"model","parts":[]}`
 				functionCall := `{"functionCall":{"name":"","args":{}}}`
 				functionCall, _ = sjson.Set(functionCall, "functionCall.name", name)
+				functionCall, _ = sjson.Set(functionCall, "thoughtSignature", geminiResponsesThoughtSignature)
 
 				// Parse arguments JSON string and set as args object
 				if arguments != "" {
@@ -143,17 +208,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 
 				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.name", functionName)
-				// Also set response.name to align with docs/convert-2.md
-				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.name", functionName)
 
 				// Parse output JSON string and set as response content
 				if output != "" {
 					outputResult := gjson.Parse(output)
-					if outputResult.IsObject() {
-						functionResponse, _ = sjson.SetRaw(functionResponse, "functionResponse.response.content", outputResult.String())
-					} else {
-						functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.content", output)
-					}
+					functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.result", outputResult.Raw)
 				}
 
 				functionContent, _ = sjson.SetRaw(functionContent, "parts.-1", functionResponse)
@@ -162,6 +221,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			return true
 		})
+	} else if input.Exists() && input.Type == gjson.String {
+		// Simple string input conversion to user message
+		userContent := `{"role":"user","parts":[{"text":""}]}`
+		userContent, _ = sjson.Set(userContent, "parts.0.text", input.String())
+		out, _ = sjson.SetRaw(out, "contents.-1", userContent)
 	}
 
 	// Convert tools to Gemini functionDeclarations format
@@ -292,6 +356,17 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			}
 		}
 	}
+
+	// For gemini-3-pro-preview, always send default thinkingConfig when none specified.
+	// This matches the official Gemini CLI behavior which always sends:
+	// { thinkingBudget: -1, includeThoughts: true }
+	// See: ai-gemini-cli/packages/core/src/config/defaultModelConfigs.ts
+	if !gjson.Get(out, "generationConfig.thinkingConfig").Exists() && modelName == "gemini-3-pro-preview" {
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
+		out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
+		// log.Debugf("Applied default thinkingConfig for gemini-3-pro-preview (matches Gemini CLI): thinkingBudget=-1, include_thoughts=true")
+	}
+
 	result := []byte(out)
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 	return result

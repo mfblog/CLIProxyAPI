@@ -17,6 +17,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const geminiCLIClaudeThoughtSignature = "skip_thought_signature_validator"
+
 // ConvertClaudeRequestToCLI parses and transforms a Claude Code API request into Gemini CLI API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the Gemini CLI API.
@@ -89,7 +91,10 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 						functionArgs := contentResult.Get("input").String()
 						var args map[string]any
 						if err := json.Unmarshal([]byte(functionArgs), &args); err == nil {
-							clientContent.Parts = append(clientContent.Parts, client.Part{FunctionCall: &client.FunctionCall{Name: functionName, Args: args}})
+							clientContent.Parts = append(clientContent.Parts, client.Part{
+								FunctionCall:     &client.FunctionCall{Name: functionName, Args: args},
+								ThoughtSignature: geminiCLIClaudeThoughtSignature,
+							})
 						}
 					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "tool_result" {
 						toolCallID := contentResult.Get("tool_use_id").String()
@@ -99,7 +104,7 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 							if len(toolCallIDs) > 1 {
 								funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-1], "-")
 							}
-							responseData := contentResult.Get("content").String()
+							responseData := contentResult.Get("content").Raw
 							functionResponse := client.FunctionResponse{Name: funcName, Response: map[string]interface{}{"result": responseData}}
 							clientContent.Parts = append(clientContent.Parts, client.Part{FunctionResponse: &functionResponse})
 						}
@@ -127,6 +132,8 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 				inputSchema := inputSchemaResult.Raw
 				tool, _ := sjson.Delete(toolResult.Raw, "input_schema")
 				tool, _ = sjson.SetRaw(tool, "parametersJsonSchema", inputSchema)
+				tool, _ = sjson.Delete(tool, "strict")
+				tool, _ = sjson.Delete(tool, "input_examples")
 				var toolDeclaration any
 				if err := json.Unmarshal([]byte(tool), &toolDeclaration); err == nil {
 					tools[0].FunctionDeclarations = append(tools[0].FunctionDeclarations, toolDeclaration)

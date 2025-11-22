@@ -295,11 +295,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
-	providerName, extractedModelName, isDynamic := h.parseDynamicModel(modelName)
+	// Resolve "auto" model to an actual available model first
+	resolvedModelName := util.ResolveAutoModel(modelName)
+	
+	providerName, extractedModelName, isDynamic := h.parseDynamicModel(resolvedModelName)
 
 	// First, normalize the model name to handle suffixes like "-thinking-128"
 	// This needs to happen before determining the provider for non-dynamic models.
-	normalizedModel, metadata = normalizeModelMetadata(modelName)
+	normalizedModel, metadata = normalizeModelMetadata(resolvedModelName)
 
 	if isDynamic {
 		providers = []string{providerName}
@@ -356,20 +359,7 @@ func cloneBytes(src []byte) []byte {
 }
 
 func normalizeModelMetadata(modelName string) (string, map[string]any) {
-	baseModel, budget, include, matched := util.ParseGeminiThinkingSuffix(modelName)
-	if !matched {
-		return baseModel, nil
-	}
-	metadata := map[string]any{
-		util.GeminiOriginalModelMetadataKey: modelName,
-	}
-	if budget != nil {
-		metadata[util.GeminiThinkingBudgetMetadataKey] = *budget
-	}
-	if include != nil {
-		metadata[util.GeminiIncludeThoughtsMetadataKey] = *include
-	}
-	return baseModel, metadata
+	return util.NormalizeGeminiThinkingModel(modelName)
 }
 
 func cloneMetadata(src map[string]any) map[string]any {

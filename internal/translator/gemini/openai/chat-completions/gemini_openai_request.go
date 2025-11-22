@@ -15,6 +15,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const geminiFunctionThoughtSignature = "skip_thought_signature_validator"
+
 // ConvertOpenAIRequestToGemini converts an OpenAI Chat Completions request (raw JSON)
 // into a complete Gemini request JSON. All JSON construction uses sjson and lookups use gjson.
 //
@@ -65,18 +67,23 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		if tc := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
 			var setBudget bool
 			var normalized int
-			if v := tc.Get("thinking_budget"); v.Exists() {
-				// Normalize budget to model range
+
+			if v := tc.Get("thinkingBudget"); v.Exists() {
+				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
+				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingBudget", normalized)
+				setBudget = true
+			} else if v := tc.Get("thinking_budget"); v.Exists() {
 				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
 				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingBudget", normalized)
 				setBudget = true
 			}
-			if v := tc.Get("include_thoughts"); v.Exists() {
+
+			if v := tc.Get("includeThoughts"); v.Exists() {
 				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", v.Bool())
-			} else if setBudget {
-				if normalized != 0 {
-					out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", true)
-				}
+			} else if v := tc.Get("include_thoughts"); v.Exists() {
+				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", v.Bool())
+			} else if setBudget && normalized != 0 {
+				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", true)
 			}
 		}
 	}
@@ -115,6 +122,9 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		if ar := imgCfg.Get("aspect_ratio"); ar.Exists() && ar.Type == gjson.String {
 			out, _ = sjson.SetBytes(out, "generationConfig.imageConfig.aspectRatio", ar.Str)
 		}
+		if size := imgCfg.Get("image_size"); size.Exists() && size.Type == gjson.String {
+			out, _ = sjson.SetBytes(out, "generationConfig.imageConfig.imageSize", size.Str)
+		}
 	}
 
 	// messages -> systemInstruction + contents
@@ -150,11 +160,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				toolCallID := m.Get("tool_call_id").String()
 				if toolCallID != "" {
 					c := m.Get("content")
-					if c.Type == gjson.String {
-						toolResponses[toolCallID] = c.String()
-					} else if c.IsObject() && c.Get("type").String() == "text" {
-						toolResponses[toolCallID] = c.Get("text").String()
-					}
+					toolResponses[toolCallID] = c.Raw
 				}
 			}
 		}
@@ -263,6 +269,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							fargs := tc.Get("function.arguments").String()
 							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
 							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
 							p++
 							if fid != "" {
 								fIDs = append(fIDs, fid)
@@ -280,7 +287,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 								if resp == "" {
 									resp = "{}"
 								}
-								toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response", []byte(`{"result":`+quoteIfNeeded(resp)+`}`))
+								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(resp))
 								pp++
 							}
 						}
@@ -293,19 +300,75 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		}
 	}
 
-	// tools -> tools[0].functionDeclarations
+	// tools -> tools[0].functionDeclarations + tools[0].googleSearch passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
-		out, _ = sjson.SetRawBytes(out, "tools", []byte(`[{"functionDeclarations":[]}]`))
-		fdPath := "tools.0.functionDeclarations"
+		toolNode := []byte(`{}`)
+		hasTool := false
+		hasFunction := false
 		for _, t := range tools.Array() {
 			if t.Get("type").String() == "function" {
 				fn := t.Get("function")
 				if fn.Exists() && fn.IsObject() {
-					parametersJsonSchema, _ := util.RenameKey(fn.Raw, "parameters", "parametersJsonSchema")
-					out, _ = sjson.SetRawBytes(out, fdPath+".-1", []byte(parametersJsonSchema))
+					fnRaw := fn.Raw
+					if fn.Get("parameters").Exists() {
+						renamed, errRename := util.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
+						if errRename != nil {
+							log.Warnf("Failed to rename parameters for tool '%s': %v", fn.Get("name").String(), errRename)
+							var errSet error
+							fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+							if errSet != nil {
+								log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
+								continue
+							}
+							fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.properties", map[string]interface{}{})
+							if errSet != nil {
+								log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
+								continue
+							}
+						} else {
+							fnRaw = renamed
+						}
+					} else {
+						var errSet error
+						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+						if errSet != nil {
+							log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
+							continue
+						}
+						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.properties", map[string]interface{}{})
+						if errSet != nil {
+							log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
+							continue
+						}
+					}
+					fnRaw, _ = sjson.Delete(fnRaw, "strict")
+					if !hasFunction {
+						toolNode, _ = sjson.SetRawBytes(toolNode, "functionDeclarations", []byte("[]"))
+					}
+					tmp, errSet := sjson.SetRawBytes(toolNode, "functionDeclarations.-1", []byte(fnRaw))
+					if errSet != nil {
+						log.Warnf("Failed to append tool declaration for '%s': %v", fn.Get("name").String(), errSet)
+						continue
+					}
+					toolNode = tmp
+					hasFunction = true
+					hasTool = true
 				}
 			}
+			if gs := t.Get("google_search"); gs.Exists() {
+				var errSet error
+				toolNode, errSet = sjson.SetRawBytes(toolNode, "googleSearch", []byte(gs.Raw))
+				if errSet != nil {
+					log.Warnf("Failed to set googleSearch tool: %v", errSet)
+					continue
+				}
+				hasTool = true
+			}
+		}
+		if hasTool {
+			out, _ = sjson.SetRawBytes(out, "tools", []byte("[]"))
+			out, _ = sjson.SetRawBytes(out, "tools.0", toolNode)
 		}
 	}
 

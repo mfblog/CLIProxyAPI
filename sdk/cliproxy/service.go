@@ -305,6 +305,12 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	if s == nil || a == nil {
 		return
 	}
+	// Skip disabled auth entries when (re)binding executors.
+	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
+	// and must not override active provider executors (such as iFlow OAuth accounts).
+	if a.Disabled {
+		return
+	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
 		if compatProviderKey == "" {
 			compatProviderKey = strings.ToLower(strings.TrimSpace(a.Provider))
@@ -318,6 +324,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	switch strings.ToLower(a.Provider) {
 	case "gemini":
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
+	case "vertex":
+		s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
 	case "gemini-cli":
 		s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))
 	case "aistudio":
@@ -325,6 +333,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 			s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, a.ID, s.wsGateway))
 		}
 		return
+	case "antigravity":
+		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "codex":
@@ -596,6 +606,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if a == nil || a.ID == "" {
 		return
 	}
+	if a.Attributes != nil {
+		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+	}
 	// Unregister legacy client ID (if present) to avoid double counting
 	if a.Runtime != nil {
 		if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
@@ -613,10 +629,17 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	switch provider {
 	case "gemini":
 		models = registry.GetGeminiModels()
+	case "vertex":
+		// Vertex AI Gemini supports the same model identifiers as Gemini.
+		models = registry.GetGeminiVertexModels()
 	case "gemini-cli":
 		models = registry.GetGeminiCLIModels()
 	case "aistudio":
 		models = registry.GetAIStudioModels()
+	case "antigravity":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
+		cancel()
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil && len(entry.Models) > 0 {
@@ -738,7 +761,7 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 			continue
 		}
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
-			if attrBase == "" || cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
 				return entry
 			}
 		}
