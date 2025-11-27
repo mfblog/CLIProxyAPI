@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -219,6 +220,14 @@ func stopForwarderInstance(port int, forwarder *callbackForwarder) {
 	log.Infof("callback forwarder on port %d stopped", port)
 }
 
+func sanitizeAntigravityFileName(email string) string {
+	if strings.TrimSpace(email) == "" {
+		return "antigravity.json"
+	}
+	replacer := strings.NewReplacer("@", "_", ".", "_")
+	return fmt.Sprintf("antigravity-%s.json", replacer.Replace(email))
+}
+
 func (h *Handler) managementCallbackURL(path string) (string, error) {
 	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
 		return "", fmt.Errorf("server port is not configured")
@@ -226,11 +235,39 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d%s", h.cfg.Port, path), nil
+	scheme := "http"
+	if h.cfg.TLS.Enable {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
 }
 
-// List auth files
 func (h *Handler) ListAuthFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		h.listAuthFilesFromDisk(c)
+		return
+	}
+	auths := h.authManager.List()
+	files := make([]gin.H, 0, len(auths))
+	for _, auth := range auths {
+		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			files = append(files, entry)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(200, gin.H{"files": files})
+}
+
+// List auth files from disk when the auth manager is unavailable.
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -261,6 +298,112 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		}
 	}
 	c.JSON(200, gin.H{"files": files})
+}
+
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	if auth == nil {
+		return nil
+	}
+	auth.EnsureIndex()
+	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		return nil
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" && !runtimeOnly {
+		return nil
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = auth.ID
+	}
+	entry := gin.H{
+		"id":             auth.ID,
+		"auth_index":     auth.Index,
+		"name":           name,
+		"type":           strings.TrimSpace(auth.Provider),
+		"provider":       strings.TrimSpace(auth.Provider),
+		"label":          auth.Label,
+		"status":         auth.Status,
+		"status_message": auth.StatusMessage,
+		"disabled":       auth.Disabled,
+		"unavailable":    auth.Unavailable,
+		"runtime_only":   runtimeOnly,
+		"source":         "memory",
+		"size":           int64(0),
+	}
+	if email := authEmail(auth); email != "" {
+		entry["email"] = email
+	}
+	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+		if accountType != "" {
+			entry["account_type"] = accountType
+		}
+		if account != "" {
+			entry["account"] = account
+		}
+	}
+	if !auth.CreatedAt.IsZero() {
+		entry["created_at"] = auth.CreatedAt
+	}
+	if !auth.UpdatedAt.IsZero() {
+		entry["modtime"] = auth.UpdatedAt
+		entry["updated_at"] = auth.UpdatedAt
+	}
+	if !auth.LastRefreshedAt.IsZero() {
+		entry["last_refresh"] = auth.LastRefreshedAt
+	}
+	if path != "" {
+		entry["path"] = path
+		entry["source"] = "file"
+		if info, err := os.Stat(path); err == nil {
+			entry["size"] = info.Size()
+			entry["modtime"] = info.ModTime()
+		} else if os.IsNotExist(err) {
+			// Hide credentials removed from disk but still lingering in memory.
+			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+				return nil
+			}
+			entry["source"] = "memory"
+		} else {
+			log.WithError(err).Warnf("failed to stat auth file %s", path)
+		}
+	}
+	return entry
+}
+
+func authEmail(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["email"].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["email"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(auth.Attributes["account_email"]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func authAttribute(auth *coreauth.Auth, key string) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	return auth.Attributes[key]
+}
+
+func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
 }
 
 // Download single auth file by name
@@ -383,6 +526,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				}
 			}
 			if err = os.Remove(full); err == nil {
+				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+					c.JSON(500, gin.H{"error": errDel.Error()})
+					return
+				}
 				deleted++
 				h.disableAuth(ctx, full)
 			}
@@ -409,8 +556,30 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		}
 		return
 	}
+	if err := h.deleteTokenRecord(ctx, full); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
 	h.disableAuth(ctx, full)
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (h *Handler) authIDForPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if h == nil || h.cfg == nil {
+		return path
+	}
+	authDir := strings.TrimSpace(h.cfg.AuthDir)
+	if authDir == "" {
+		return path
+	}
+	if rel, err := filepath.Rel(authDir, path); err == nil && rel != "" {
+		return rel
+	}
+	return path
 }
 
 func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []byte) error {
@@ -441,13 +610,18 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 
+	authID := h.authIDForPath(path)
+	if authID == "" {
+		authID = path
+	}
 	attr := map[string]string{
 		"path":   path,
 		"source": path,
 	}
 	auth := &coreauth.Auth{
-		ID:         path,
+		ID:         authID,
 		Provider:   provider,
+		FileName:   filepath.Base(path),
 		Label:      label,
 		Status:     coreauth.StatusActive,
 		Attributes: attr,
@@ -458,7 +632,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
-	if existing, ok := h.authManager.GetByID(path); ok {
+	if existing, ok := h.authManager.GetByID(authID); ok {
 		auth.CreatedAt = existing.CreatedAt
 		if !hasLastRefresh {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
@@ -473,10 +647,17 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {
-	if h.authManager == nil || id == "" {
+	if h == nil || h.authManager == nil {
 		return
 	}
-	if auth, ok := h.authManager.GetByID(id); ok {
+	authID := h.authIDForPath(id)
+	if authID == "" {
+		authID = strings.TrimSpace(id)
+	}
+	if authID == "" {
+		return
+	}
+	if auth, ok := h.authManager.GetByID(authID); ok {
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
@@ -485,9 +666,20 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
-func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
-	if record == nil {
-		return "", fmt.Errorf("token record is nil")
+func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("auth path is empty")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
+	}
+	return store.Delete(ctx, path)
+}
+
+func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
+	if h == nil {
+		return nil
 	}
 	store := h.tokenStore
 	if store == nil {
@@ -498,6 +690,17 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
+	}
+	return store
+}
+
+func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	if record == nil {
+		return "", fmt.Errorf("token record is nil")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return "", fmt.Errorf("token store unavailable")
 	}
 	return store.Save(ctx, record)
 }
@@ -846,29 +1049,46 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 		fmt.Println("Authentication successful.")
 
-		if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
-			log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-			oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
-			return
-		}
+		if strings.EqualFold(requestedProjectID, "ALL") {
+			ts.Auto = false
+			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
+			if errAll != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
+				oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
+				return
+			}
+			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
+				oauthStatus[state] = "Failed to verify Cloud AI API status"
+				return
+			}
+			ts.ProjectID = strings.Join(projects, ",")
+			ts.Checked = true
+		} else {
+			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
+				oauthStatus[state] = "Failed to complete Gemini CLI onboarding"
+				return
+			}
 
-		if strings.TrimSpace(ts.ProjectID) == "" {
-			log.Error("Onboarding did not return a project ID")
-			oauthStatus[state] = "Failed to resolve project ID"
-			return
-		}
+			if strings.TrimSpace(ts.ProjectID) == "" {
+				log.Error("Onboarding did not return a project ID")
+				oauthStatus[state] = "Failed to resolve project ID"
+				return
+			}
 
-		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-		if errCheck != nil {
-			log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-			oauthStatus[state] = "Failed to verify Cloud AI API status"
-			return
-		}
-		ts.Checked = isChecked
-		if !isChecked {
-			log.Error("Cloud AI API is not enabled for the selected project")
-			oauthStatus[state] = "Cloud AI API not enabled"
-			return
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				oauthStatus[state] = "Failed to verify Cloud AI API status"
+				return
+			}
+			ts.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the selected project")
+				oauthStatus[state] = "Cloud AI API not enabled"
+				return
+			}
 		}
 
 		recordMetadata := map[string]any{
@@ -878,10 +1098,11 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			"checked":    ts.Checked,
 		}
 
+		fileName := geminiAuth.CredentialFileName(ts.Email, ts.ProjectID, true)
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("gemini-%s-%s.json", ts.Email, ts.ProjectID),
+			ID:       fileName,
 			Provider: "gemini",
-			FileName: fmt.Sprintf("gemini-%s-%s.json", ts.Email, ts.ProjectID),
+			FileName: fileName,
 			Storage:  &ts,
 			Metadata: recordMetadata,
 		}
@@ -1075,6 +1296,222 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+func (h *Handler) RequestAntigravityToken(c *gin.Context) {
+	const (
+		antigravityCallbackPort = 51121
+		antigravityClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+		antigravityClientSecret = "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"
+	)
+	var antigravityScopes = []string{
+		"https://www.googleapis.com/auth/cloud-platform",
+		"https://www.googleapis.com/auth/userinfo.email",
+		"https://www.googleapis.com/auth/userinfo.profile",
+		"https://www.googleapis.com/auth/cclog",
+		"https://www.googleapis.com/auth/experimentsandconfigs",
+	}
+
+	ctx := context.Background()
+
+	fmt.Println("Initializing Antigravity authentication...")
+
+	state, errState := misc.GenerateRandomState()
+	if errState != nil {
+		log.Fatalf("Failed to generate state parameter: %v", errState)
+		return
+	}
+
+	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravityCallbackPort)
+
+	params := url.Values{}
+	params.Set("access_type", "offline")
+	params.Set("client_id", antigravityClientID)
+	params.Set("prompt", "consent")
+	params.Set("redirect_uri", redirectURI)
+	params.Set("response_type", "code")
+	params.Set("scope", strings.Join(antigravityScopes, " "))
+	params.Set("state", state)
+	authURL := "https://accounts.google.com/o/oauth2/v2/auth?" + params.Encode()
+
+	isWebUI := isWebUIRequest(c)
+	if isWebUI {
+		targetURL, errTarget := h.managementCallbackURL("/antigravity/callback")
+		if errTarget != nil {
+			log.WithError(errTarget).Error("failed to compute antigravity callback target")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
+			return
+		}
+		if _, errStart := startCallbackForwarder(antigravityCallbackPort, "antigravity", targetURL); errStart != nil {
+			log.WithError(errStart).Error("failed to start antigravity callback forwarder")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+			return
+		}
+	}
+
+	go func() {
+		if isWebUI {
+			defer stopCallbackForwarder(antigravityCallbackPort)
+		}
+
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
+		deadline := time.Now().Add(5 * time.Minute)
+		var authCode string
+		for {
+			if time.Now().After(deadline) {
+				log.Error("oauth flow timed out")
+				oauthStatus[state] = "OAuth flow timed out"
+				return
+			}
+			if data, errReadFile := os.ReadFile(waitFile); errReadFile == nil {
+				var payload map[string]string
+				_ = json.Unmarshal(data, &payload)
+				_ = os.Remove(waitFile)
+				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
+					log.Errorf("Authentication failed: %s", errStr)
+					oauthStatus[state] = "Authentication failed"
+					return
+				}
+				if payloadState := strings.TrimSpace(payload["state"]); payloadState != "" && payloadState != state {
+					log.Errorf("Authentication failed: state mismatch")
+					oauthStatus[state] = "Authentication failed: state mismatch"
+					return
+				}
+				authCode = strings.TrimSpace(payload["code"])
+				if authCode == "" {
+					log.Error("Authentication failed: code not found")
+					oauthStatus[state] = "Authentication failed: code not found"
+					return
+				}
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+		form := url.Values{}
+		form.Set("code", authCode)
+		form.Set("client_id", antigravityClientID)
+		form.Set("client_secret", antigravityClientSecret)
+		form.Set("redirect_uri", redirectURI)
+		form.Set("grant_type", "authorization_code")
+
+		req, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+		if errNewRequest != nil {
+			log.Errorf("Failed to build token request: %v", errNewRequest)
+			oauthStatus[state] = "Failed to build token request"
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, errDo := httpClient.Do(req)
+		if errDo != nil {
+			log.Errorf("Failed to execute token request: %v", errDo)
+			oauthStatus[state] = "Failed to exchange token"
+			return
+		}
+		defer func() {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("antigravity token exchange close error: %v", errClose)
+			}
+		}()
+
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Errorf("Antigravity token exchange failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			oauthStatus[state] = fmt.Sprintf("Token exchange failed: %d", resp.StatusCode)
+			return
+		}
+
+		var tokenResp struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int64  `json:"expires_in"`
+			TokenType    string `json:"token_type"`
+		}
+		if errDecode := json.NewDecoder(resp.Body).Decode(&tokenResp); errDecode != nil {
+			log.Errorf("Failed to parse token response: %v", errDecode)
+			oauthStatus[state] = "Failed to parse token response"
+			return
+		}
+
+		email := ""
+		if strings.TrimSpace(tokenResp.AccessToken) != "" {
+			infoReq, errInfoReq := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
+			if errInfoReq != nil {
+				log.Errorf("Failed to build user info request: %v", errInfoReq)
+				oauthStatus[state] = "Failed to build user info request"
+				return
+			}
+			infoReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+
+			infoResp, errInfo := httpClient.Do(infoReq)
+			if errInfo != nil {
+				log.Errorf("Failed to execute user info request: %v", errInfo)
+				oauthStatus[state] = "Failed to execute user info request"
+				return
+			}
+			defer func() {
+				if errClose := infoResp.Body.Close(); errClose != nil {
+					log.Errorf("antigravity user info close error: %v", errClose)
+				}
+			}()
+
+			if infoResp.StatusCode >= http.StatusOK && infoResp.StatusCode < http.StatusMultipleChoices {
+				var infoPayload struct {
+					Email string `json:"email"`
+				}
+				if errDecodeInfo := json.NewDecoder(infoResp.Body).Decode(&infoPayload); errDecodeInfo == nil {
+					email = strings.TrimSpace(infoPayload.Email)
+				}
+			} else {
+				bodyBytes, _ := io.ReadAll(infoResp.Body)
+				log.Errorf("User info request failed with status %d: %s", infoResp.StatusCode, string(bodyBytes))
+				oauthStatus[state] = fmt.Sprintf("User info request failed: %d", infoResp.StatusCode)
+				return
+			}
+		}
+
+		now := time.Now()
+		metadata := map[string]any{
+			"type":          "antigravity",
+			"access_token":  tokenResp.AccessToken,
+			"refresh_token": tokenResp.RefreshToken,
+			"expires_in":    tokenResp.ExpiresIn,
+			"timestamp":     now.UnixMilli(),
+			"expired":       now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		}
+		if email != "" {
+			metadata["email"] = email
+		}
+
+		fileName := sanitizeAntigravityFileName(email)
+		label := strings.TrimSpace(email)
+		if label == "" {
+			label = "antigravity"
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "antigravity",
+			FileName: fileName,
+			Label:    label,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Fatalf("Failed to save token to file: %v", errSave)
+			oauthStatus[state] = "Failed to save token to file"
+			return
+		}
+
+		delete(oauthStatus, state)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use Antigravity services through this CLI")
+	}()
+
+	oauthStatus[state] = ""
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
 func (h *Handler) RequestQwenToken(c *gin.Context) {
 	ctx := context.Background()
 
@@ -1234,6 +1671,87 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
+	ctx := context.Background()
+
+	var payload struct {
+		Cookie string `json:"cookie"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
+		return
+	}
+
+	cookieValue := strings.TrimSpace(payload.Cookie)
+
+	if cookieValue == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
+		return
+	}
+
+	cookieValue, errNormalize := iflowauth.NormalizeCookie(cookieValue)
+	if errNormalize != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errNormalize.Error()})
+		return
+	}
+
+	authSvc := iflowauth.NewIFlowAuth(h.cfg)
+	tokenData, errAuth := authSvc.AuthenticateWithCookie(ctx, cookieValue)
+	if errAuth != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAuth.Error()})
+		return
+	}
+
+	tokenData.Cookie = cookieValue
+
+	tokenStorage := authSvc.CreateCookieTokenStorage(tokenData)
+	email := strings.TrimSpace(tokenStorage.Email)
+	if email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "failed to extract email from token"})
+		return
+	}
+
+	fileName := iflowauth.SanitizeIFlowFileName(email)
+	if fileName == "" {
+		fileName = fmt.Sprintf("iflow-%d", time.Now().UnixMilli())
+	}
+
+	tokenStorage.Email = email
+
+	record := &coreauth.Auth{
+		ID:       fmt.Sprintf("iflow-%s.json", fileName),
+		Provider: "iflow",
+		FileName: fmt.Sprintf("iflow-%s.json", fileName),
+		Storage:  tokenStorage,
+		Metadata: map[string]any{
+			"email":        email,
+			"api_key":      tokenStorage.APIKey,
+			"expired":      tokenStorage.Expire,
+			"cookie":       tokenStorage.Cookie,
+			"type":         tokenStorage.Type,
+			"last_refresh": tokenStorage.LastRefresh,
+		},
+		Attributes: map[string]string{
+			"api_key": tokenStorage.APIKey,
+		},
+	}
+
+	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
+		return
+	}
+
+	fmt.Printf("iFlow cookie authentication successful. Token saved to %s\n", savedPath)
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"saved_path": savedPath,
+		"email":      email,
+		"expired":    tokenStorage.Expire,
+		"type":       tokenStorage.Type,
+	})
+}
+
 type projectSelectionRequiredError struct{}
 
 func (e *projectSelectionRequiredError) Error() string {
@@ -1271,6 +1789,57 @@ func ensureGeminiProjectAndOnboard(ctx context.Context, httpClient *http.Client,
 		storage.ProjectID = trimmedRequest
 	}
 
+	return nil
+}
+
+func onboardAllGeminiProjects(ctx context.Context, httpClient *http.Client, storage *geminiAuth.GeminiTokenStorage) ([]string, error) {
+	projects, errProjects := fetchGCPProjects(ctx, httpClient)
+	if errProjects != nil {
+		return nil, fmt.Errorf("fetch project list: %w", errProjects)
+	}
+	if len(projects) == 0 {
+		return nil, fmt.Errorf("no Google Cloud projects available for this account")
+	}
+	activated := make([]string, 0, len(projects))
+	seen := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		candidate := strings.TrimSpace(project.ProjectID)
+		if candidate == "" {
+			continue
+		}
+		if _, dup := seen[candidate]; dup {
+			continue
+		}
+		if err := performGeminiCLISetup(ctx, httpClient, storage, candidate); err != nil {
+			return nil, fmt.Errorf("onboard project %s: %w", candidate, err)
+		}
+		finalID := strings.TrimSpace(storage.ProjectID)
+		if finalID == "" {
+			finalID = candidate
+		}
+		activated = append(activated, finalID)
+		seen[candidate] = struct{}{}
+	}
+	if len(activated) == 0 {
+		return nil, fmt.Errorf("no Google Cloud projects available for this account")
+	}
+	return activated, nil
+}
+
+func ensureGeminiProjectsEnabled(ctx context.Context, httpClient *http.Client, projectIDs []string) error {
+	for _, pid := range projectIDs {
+		trimmed := strings.TrimSpace(pid)
+		if trimmed == "" {
+			continue
+		}
+		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, trimmed)
+		if errCheck != nil {
+			return fmt.Errorf("project %s: %w", trimmed, errCheck)
+		}
+		if !isChecked {
+			return fmt.Errorf("project %s: Cloud AI API not enabled", trimmed)
+		}
+	}
 	return nil
 }
 

@@ -6,6 +6,7 @@ package middleware
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,23 +16,22 @@ import (
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
-// and uses the provided RequestLogger to record this data. If logging is disabled in the
-// logger, the middleware has minimal overhead.
+// and uses the provided RequestLogger to record this data. When logging is disabled in the
+// logger, it still captures data so that upstream errors can be persisted.
 func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		path := c.Request.URL.Path
-		shouldLog := false
-		if strings.HasPrefix(path, "/v1") {
-			shouldLog = true
-		}
-
-		if !shouldLog {
+		if logger == nil {
 			c.Next()
 			return
 		}
 
-		// Early return if logging is disabled (zero overhead)
-		if !logger.IsEnabled() {
+		if c.Request.Method == http.MethodGet {
+			c.Next()
+			return
+		}
+
+		path := c.Request.URL.Path
+		if !shouldLogRequest(path) {
 			c.Next()
 			return
 		}
@@ -47,6 +47,9 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
+		if !logger.IsEnabled() {
+			wrapper.logOnErrorOnly = true
+		}
 		c.Writer = wrapper
 
 		// Process the request
@@ -100,4 +103,14 @@ func captureRequestInfo(c *gin.Context) (*RequestInfo, error) {
 		Headers: headers,
 		Body:    body,
 	}, nil
+}
+
+// shouldLogRequest determines whether the request should be logged.
+// It skips management endpoints to avoid leaking secrets but allows
+// all other routes, including module-provided ones, to honor request-log.
+func shouldLogRequest(path string) bool {
+	if strings.HasPrefix(path, "/v0/management") || strings.HasPrefix(path, "/management") {
+		return false
+	}
+	return true
 }

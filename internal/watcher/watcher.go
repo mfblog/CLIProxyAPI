@@ -21,6 +21,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	"gopkg.in/yaml.v3"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -41,24 +42,26 @@ type authDirProvider interface {
 
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
-	configPath      string
-	authDir         string
-	config          *config.Config
-	clientsMutex    sync.RWMutex
-	reloadCallback  func(*config.Config)
-	watcher         *fsnotify.Watcher
-	lastAuthHashes  map[string]string
-	lastConfigHash  string
-	authQueue       chan<- AuthUpdate
-	currentAuths    map[string]*coreauth.Auth
-	dispatchMu      sync.Mutex
-	dispatchCond    *sync.Cond
-	pendingUpdates  map[string]AuthUpdate
-	pendingOrder    []string
-	dispatchCancel  context.CancelFunc
-	storePersister  storePersister
-	mirroredAuthDir string
-	oldConfigYaml   []byte
+	configPath        string
+	authDir           string
+	config            *config.Config
+	clientsMutex      sync.RWMutex
+	configReloadMu    sync.Mutex
+	configReloadTimer *time.Timer
+	reloadCallback    func(*config.Config)
+	watcher           *fsnotify.Watcher
+	lastAuthHashes    map[string]string
+	lastConfigHash    string
+	authQueue         chan<- AuthUpdate
+	currentAuths      map[string]*coreauth.Auth
+	dispatchMu        sync.Mutex
+	dispatchCond      *sync.Cond
+	pendingUpdates    map[string]AuthUpdate
+	pendingOrder      []string
+	dispatchCancel    context.CancelFunc
+	storePersister    storePersister
+	mirroredAuthDir   string
+	oldConfigYaml     []byte
 }
 
 type stableIDGenerator struct {
@@ -113,7 +116,8 @@ type AuthUpdate struct {
 const (
 	// replaceCheckDelay is a short delay to allow atomic replace (rename) to settle
 	// before deciding whether a Remove event indicates a real deletion.
-	replaceCheckDelay = 50 * time.Millisecond
+	replaceCheckDelay    = 50 * time.Millisecond
+	configReloadDebounce = 150 * time.Millisecond
 )
 
 // NewWatcher creates a new file watcher instance
@@ -172,7 +176,17 @@ func (w *Watcher) Start(ctx context.Context) error {
 // Stop stops the file watcher
 func (w *Watcher) Stop() error {
 	w.stopDispatch()
+	w.stopConfigReloadTimer()
 	return w.watcher.Close()
+}
+
+func (w *Watcher) stopConfigReloadTimer() {
+	w.configReloadMu.Lock()
+	if w.configReloadTimer != nil {
+		w.configReloadTimer.Stop()
+		w.configReloadTimer = nil
+	}
+	w.configReloadMu.Unlock()
 }
 
 // SetConfig updates the current configuration
@@ -460,11 +474,40 @@ func (w *Watcher) processEvents(ctx context.Context) {
 	}
 }
 
+func (w *Watcher) authFileUnchanged(path string) (bool, error) {
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return false, errRead
+	}
+	if len(data) == 0 {
+		return false, nil
+	}
+	sum := sha256.Sum256(data)
+	curHash := hex.EncodeToString(sum[:])
+
+	w.clientsMutex.RLock()
+	prevHash, ok := w.lastAuthHashes[path]
+	w.clientsMutex.RUnlock()
+	if ok && prevHash == curHash {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (w *Watcher) isKnownAuthFile(path string) bool {
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	_, ok := w.lastAuthHashes[path]
+	return ok
+}
+
 // handleEvent processes individual file system events
 func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Filter only relevant events: config file or auth-dir JSON files.
-	isConfigEvent := event.Name == w.configPath && (event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create)
-	isAuthJSON := strings.HasPrefix(event.Name, w.authDir) && strings.HasSuffix(event.Name, ".json")
+	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
+	isConfigEvent := event.Name == w.configPath && event.Op&configOps != 0
+	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
+	isAuthJSON := strings.HasPrefix(event.Name, w.authDir) && strings.HasSuffix(event.Name, ".json") && event.Op&authOps != 0
 	if !isConfigEvent && !isAuthJSON {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
@@ -476,57 +519,90 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle config file changes
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
-		data, err := os.ReadFile(w.configPath)
-		if err != nil {
-			log.Errorf("failed to read config file for hash check: %v", err)
-			return
-		}
-		if len(data) == 0 {
-			log.Debugf("ignoring empty config file write event")
-			return
-		}
-		sum := sha256.Sum256(data)
-		newHash := hex.EncodeToString(sum[:])
-
-		w.clientsMutex.RLock()
-		currentHash := w.lastConfigHash
-		w.clientsMutex.RUnlock()
-
-		if currentHash != "" && currentHash == newHash {
-			log.Debugf("config file content unchanged (hash match), skipping reload")
-			return
-		}
-		fmt.Printf("config file changed, reloading: %s\n", w.configPath)
-		if w.reloadConfig() {
-			finalHash := newHash
-			if updatedData, errRead := os.ReadFile(w.configPath); errRead == nil && len(updatedData) > 0 {
-				sumUpdated := sha256.Sum256(updatedData)
-				finalHash = hex.EncodeToString(sumUpdated[:])
-			} else if errRead != nil {
-				log.WithError(errRead).Debug("failed to compute updated config hash after reload")
-			}
-			w.clientsMutex.Lock()
-			w.lastConfigHash = finalHash
-			w.clientsMutex.Unlock()
-			w.persistConfigAsync()
-		}
+		w.scheduleConfigReload()
 		return
 	}
 
 	// Handle auth directory changes incrementally (.json only)
-	fmt.Printf("auth file changed (%s): %s, processing incrementally\n", event.Op.String(), filepath.Base(event.Name))
-	if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-		w.addOrUpdateClient(event.Name)
-	} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-		// Atomic replace on some platforms may surface as Remove+Create for the target path.
-		// Wait briefly; if the file exists again, treat as update instead of removal.
+	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		// Atomic replace on some platforms may surface as Rename (or Remove) before the new file is ready.
+		// Wait briefly; if the path exists again, treat as an update instead of removal.
 		time.Sleep(replaceCheckDelay)
 		if _, statErr := os.Stat(event.Name); statErr == nil {
-			// File exists after a short delay; handle as an update.
+			if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
+				log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
+				return
+			}
+			fmt.Printf("auth file changed (%s): %s, processing incrementally\n", event.Op.String(), filepath.Base(event.Name))
 			w.addOrUpdateClient(event.Name)
 			return
 		}
+		if !w.isKnownAuthFile(event.Name) {
+			log.Debugf("ignoring remove for unknown auth file: %s", filepath.Base(event.Name))
+			return
+		}
+		fmt.Printf("auth file changed (%s): %s, processing incrementally\n", event.Op.String(), filepath.Base(event.Name))
 		w.removeClient(event.Name)
+		return
+	}
+	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+		if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
+			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
+			return
+		}
+		fmt.Printf("auth file changed (%s): %s, processing incrementally\n", event.Op.String(), filepath.Base(event.Name))
+		w.addOrUpdateClient(event.Name)
+	}
+}
+
+func (w *Watcher) scheduleConfigReload() {
+	w.configReloadMu.Lock()
+	defer w.configReloadMu.Unlock()
+	if w.configReloadTimer != nil {
+		w.configReloadTimer.Stop()
+	}
+	w.configReloadTimer = time.AfterFunc(configReloadDebounce, func() {
+		w.configReloadMu.Lock()
+		w.configReloadTimer = nil
+		w.configReloadMu.Unlock()
+		w.reloadConfigIfChanged()
+	})
+}
+
+func (w *Watcher) reloadConfigIfChanged() {
+	data, err := os.ReadFile(w.configPath)
+	if err != nil {
+		log.Errorf("failed to read config file for hash check: %v", err)
+		return
+	}
+	if len(data) == 0 {
+		log.Debugf("ignoring empty config file write event")
+		return
+	}
+	sum := sha256.Sum256(data)
+	newHash := hex.EncodeToString(sum[:])
+
+	w.clientsMutex.RLock()
+	currentHash := w.lastConfigHash
+	w.clientsMutex.RUnlock()
+
+	if currentHash != "" && currentHash == newHash {
+		log.Debugf("config file content unchanged (hash match), skipping reload")
+		return
+	}
+	fmt.Printf("config file changed, reloading: %s\n", w.configPath)
+	if w.reloadConfig() {
+		finalHash := newHash
+		if updatedData, errRead := os.ReadFile(w.configPath); errRead == nil && len(updatedData) > 0 {
+			sumUpdated := sha256.Sum256(updatedData)
+			finalHash = hex.EncodeToString(sumUpdated[:])
+		} else if errRead != nil {
+			log.WithError(errRead).Debug("failed to compute updated config hash after reload")
+		}
+		w.clientsMutex.Lock()
+		w.lastConfigHash = finalHash
+		w.clientsMutex.Unlock()
+		w.persistConfigAsync()
 	}
 }
 
@@ -762,16 +838,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if base != "" {
 				attrs["base_url"] = base
 			}
-			if len(entry.Headers) > 0 {
-				for hk, hv := range entry.Headers {
-					key := strings.TrimSpace(hk)
-					val := strings.TrimSpace(hv)
-					if key == "" || val == "" {
-						continue
-					}
-					attrs["header:"+key] = val
-				}
-			}
+			addConfigHeadersToAttrs(entry.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
 				Provider:   "gemini",
@@ -803,6 +870,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if hash := computeClaudeModelsHash(ck.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
+			addConfigHeadersToAttrs(ck.Headers, attrs)
 			proxyURL := strings.TrimSpace(ck.ProxyURL)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -831,6 +899,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if ck.BaseURL != "" {
 				attrs["base_url"] = ck.BaseURL
 			}
+			addConfigHeadersToAttrs(ck.Headers, attrs)
 			proxyURL := strings.TrimSpace(ck.ProxyURL)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -873,6 +942,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 					if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 						attrs["models_hash"] = hash
 					}
+					addConfigHeadersToAttrs(compat.Headers, attrs)
 					a := &coreauth.Auth{
 						ID:         id,
 						Provider:   providerName,
@@ -905,6 +975,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 					if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 						attrs["models_hash"] = hash
 					}
+					addConfigHeadersToAttrs(compat.Headers, attrs)
 					a := &coreauth.Auth{
 						ID:         id,
 						Provider:   providerName,
@@ -930,6 +1001,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 				if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 					attrs["models_hash"] = hash
 				}
+				addConfigHeadersToAttrs(compat.Headers, attrs)
 				a := &coreauth.Auth{
 					ID:         id,
 					Provider:   providerName,
@@ -999,9 +1071,117 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			CreatedAt: now,
 			UpdatedAt: now,
 		}
+		if provider == "gemini-cli" {
+			if virtuals := synthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
+				out = append(out, a)
+				out = append(out, virtuals...)
+				continue
+			}
+		}
 		out = append(out, a)
 	}
 	return out
+}
+
+func synthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]any, now time.Time) []*coreauth.Auth {
+	if primary == nil || metadata == nil {
+		return nil
+	}
+	projects := splitGeminiProjectIDs(metadata)
+	if len(projects) <= 1 {
+		return nil
+	}
+	email, _ := metadata["email"].(string)
+	shared := geminicli.NewSharedCredential(primary.ID, email, metadata, projects)
+	primary.Disabled = true
+	primary.Status = coreauth.StatusDisabled
+	primary.Runtime = shared
+	if primary.Attributes == nil {
+		primary.Attributes = make(map[string]string)
+	}
+	primary.Attributes["gemini_virtual_primary"] = "true"
+	primary.Attributes["virtual_children"] = strings.Join(projects, ",")
+	source := primary.Attributes["source"]
+	authPath := primary.Attributes["path"]
+	originalProvider := primary.Provider
+	if originalProvider == "" {
+		originalProvider = "gemini-cli"
+	}
+	label := primary.Label
+	if label == "" {
+		label = originalProvider
+	}
+	virtuals := make([]*coreauth.Auth, 0, len(projects))
+	for _, projectID := range projects {
+		attrs := map[string]string{
+			"runtime_only":           "true",
+			"gemini_virtual_parent":  primary.ID,
+			"gemini_virtual_project": projectID,
+		}
+		if source != "" {
+			attrs["source"] = source
+		}
+		if authPath != "" {
+			attrs["path"] = authPath
+		}
+		metadataCopy := map[string]any{
+			"email":             email,
+			"project_id":        projectID,
+			"virtual":           true,
+			"virtual_parent_id": primary.ID,
+			"type":              metadata["type"],
+		}
+		proxy := strings.TrimSpace(primary.ProxyURL)
+		if proxy != "" {
+			metadataCopy["proxy_url"] = proxy
+		}
+		virtual := &coreauth.Auth{
+			ID:         buildGeminiVirtualID(primary.ID, projectID),
+			Provider:   originalProvider,
+			Label:      fmt.Sprintf("%s [%s]", label, projectID),
+			Status:     coreauth.StatusActive,
+			Attributes: attrs,
+			Metadata:   metadataCopy,
+			ProxyURL:   primary.ProxyURL,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			Runtime:    geminicli.NewVirtualCredential(projectID, shared),
+		}
+		virtuals = append(virtuals, virtual)
+	}
+	return virtuals
+}
+
+func splitGeminiProjectIDs(metadata map[string]any) []string {
+	raw, _ := metadata["project_id"].(string)
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	parts := strings.Split(trimmed, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+func buildGeminiVirtualID(baseID, projectID string) string {
+	project := strings.TrimSpace(projectID)
+	if project == "" {
+		project = "project"
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
+	return fmt.Sprintf("%s::%s", baseID, replacer.Replace(project))
 }
 
 // buildCombinedClientMap merges file-based clients with API key clients from the cache.
@@ -1131,12 +1311,15 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	newKeyCount := countAPIKeys(newEntry)
 	oldModelCount := countOpenAIModels(oldEntry.Models)
 	newModelCount := countOpenAIModels(newEntry.Models)
-	details := make([]string, 0, 2)
+	details := make([]string, 0, 3)
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
 	}
 	if oldModelCount != newModelCount {
 		details = append(details, fmt.Sprintf("models %d -> %d", oldModelCount, newModelCount))
+	}
+	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
+		details = append(details, "headers updated")
 	}
 	if len(details) == 0 {
 		return ""
@@ -1236,6 +1419,9 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
 	}
+	if oldCfg.MaxRetryInterval != newCfg.MaxRetryInterval {
+		changes = append(changes, fmt.Sprintf("max-retry-interval: %d -> %d", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
+	}
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", oldCfg.ProxyURL, newCfg.ProxyURL))
 	}
@@ -1303,6 +1489,9 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("claude[%d].api-key: updated", i))
 			}
+			if !equalStringMap(o.Headers, n.Headers) {
+				changes = append(changes, fmt.Sprintf("claude[%d].headers: updated", i))
+			}
 		}
 	}
 
@@ -1324,6 +1513,9 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("codex[%d].api-key: updated", i))
+			}
+			if !equalStringMap(o.Headers, n.Headers) {
+				changes = append(changes, fmt.Sprintf("codex[%d].headers: updated", i))
 			}
 		}
 	}
@@ -1355,6 +1547,20 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 
 	return changes
+}
+
+func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string) {
+	if len(headers) == 0 || attrs == nil {
+		return
+	}
+	for hk, hv := range headers {
+		key := strings.TrimSpace(hk)
+		val := strings.TrimSpace(hv)
+		if key == "" || val == "" {
+			continue
+		}
+		attrs["header:"+key] = val
+	}
 }
 
 func trimStrings(in []string) []string {

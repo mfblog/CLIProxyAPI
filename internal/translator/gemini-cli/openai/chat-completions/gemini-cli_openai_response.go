@@ -104,17 +104,31 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 			partResult := partResults[i]
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
+			thoughtSignatureResult := partResult.Get("thoughtSignature")
+			if !thoughtSignatureResult.Exists() {
+				thoughtSignatureResult = partResult.Get("thought_signature")
+			}
 			inlineDataResult := partResult.Get("inlineData")
 			if !inlineDataResult.Exists() {
 				inlineDataResult = partResult.Get("inline_data")
 			}
 
+			hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
+			hasContentPayload := partTextResult.Exists() || functionCallResult.Exists() || inlineDataResult.Exists()
+
+			// Ignore encrypted thoughtSignature but keep any actual content in the same part.
+			if hasThoughtSignature && !hasContentPayload {
+				continue
+			}
+
 			if partTextResult.Exists() {
+				textContent := partTextResult.String()
+
 				// Handle text content, distinguishing between regular content and reasoning/thoughts.
 				if partResult.Get("thought").Bool() {
-					template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", partTextResult.String())
+					template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", textContent)
 				} else {
-					template, _ = sjson.Set(template, "choices.0.delta.content", partTextResult.String())
+					template, _ = sjson.Set(template, "choices.0.delta.content", textContent)
 				}
 				template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 			} else if functionCallResult.Exists() {

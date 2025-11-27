@@ -5,6 +5,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -21,6 +22,20 @@ type Config struct {
 	config.SDKConfig `yaml:",inline"`
 	// Port is the network port on which the API server will listen.
 	Port int `yaml:"port" json:"-"`
+
+	// TLS config controls HTTPS server settings.
+	TLS TLSConfig `yaml:"tls" json:"tls"`
+
+	// AmpUpstreamURL defines the upstream Amp control plane used for non-provider calls.
+	AmpUpstreamURL string `yaml:"amp-upstream-url" json:"amp-upstream-url"`
+
+	// AmpUpstreamAPIKey optionally overrides the Authorization header when proxying Amp upstream calls.
+	AmpUpstreamAPIKey string `yaml:"amp-upstream-api-key" json:"amp-upstream-api-key"`
+
+	// AmpRestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
+	// to only accept connections from localhost (127.0.0.1, ::1). When true, prevents drive-by
+	// browser attacks and remote access to management endpoints. Default: true (recommended).
+	AmpRestrictManagementToLocalhost bool `yaml:"amp-restrict-management-to-localhost" json:"amp-restrict-management-to-localhost"`
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
@@ -51,6 +66,8 @@ type Config struct {
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
+	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
+	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
@@ -63,6 +80,19 @@ type Config struct {
 
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
+
+	// Payload defines default and override rules for provider payload parameters.
+	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// TLSConfig holds HTTPS server settings.
+type TLSConfig struct {
+	// Enable toggles HTTPS server mode.
+	Enable bool `yaml:"enable" json:"enable"`
+	// Cert is the path to the TLS certificate file.
+	Cert string `yaml:"cert" json:"cert"`
+	// Key is the path to the TLS private key file.
+	Key string `yaml:"key" json:"key"`
 }
 
 // RemoteManagement holds management API configuration under 'remote-management'.
@@ -85,6 +115,30 @@ type QuotaExceeded struct {
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
 }
 
+// PayloadConfig defines default and override parameter rules applied to provider payloads.
+type PayloadConfig struct {
+	// Default defines rules that only set parameters when they are missing in the payload.
+	Default []PayloadRule `yaml:"default" json:"default"`
+	// Override defines rules that always set parameters, overwriting any existing values.
+	Override []PayloadRule `yaml:"override" json:"override"`
+}
+
+// PayloadRule describes a single rule targeting a list of models with parameter updates.
+type PayloadRule struct {
+	// Models lists model entries with name pattern and protocol constraint.
+	Models []PayloadModelRule `yaml:"models" json:"models"`
+	// Params maps JSON paths (gjson/sjson syntax) to values written into the payload.
+	Params map[string]any `yaml:"params" json:"params"`
+}
+
+// PayloadModelRule ties a model name pattern to a specific translator protocol.
+type PayloadModelRule struct {
+	// Name is the model name or wildcard pattern (e.g., "gpt-*", "*-5", "gemini-*-pro").
+	Name string `yaml:"name" json:"name"`
+	// Protocol restricts the rule to a specific translator format (e.g., "gemini", "responses").
+	Protocol string `yaml:"protocol" json:"protocol"`
+}
+
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
@@ -100,6 +154,9 @@ type ClaudeKey struct {
 
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 }
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
@@ -123,6 +180,9 @@ type CodexKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 }
 
 // GeminiKey represents the configuration for a Gemini API key,
@@ -159,6 +219,9 @@ type OpenAICompatibility struct {
 
 	// Models defines the model configurations including aliases for routing.
 	Models []OpenAICompatibilityModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests sent to this provider.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -221,6 +284,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LoggingToFile = false
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
+	cfg.AmpRestrictManagementToLocalhost = true // Default to secure: only localhost access
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -246,23 +310,26 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sync request authentication providers with inline API keys for backwards compatibility.
 	syncInlineAccessProvider(&cfg)
 
-	// Normalize Gemini API key configuration and migrate legacy entries.
-	cfg.SyncGeminiKeys()
-
-	// Sanitize OpenAI compatibility providers: drop entries without base-url
-	sanitizeOpenAICompatibility(&cfg)
+	// Sanitize Gemini API key configuration and migrate legacy entries.
+	cfg.SanitizeGeminiKeys()
 
 	// Sanitize Codex keys: drop entries without base-url
-	sanitizeCodexKeys(&cfg)
+	cfg.SanitizeCodexKeys()
+
+	// Sanitize Claude key headers
+	cfg.SanitizeClaudeKeys()
+
+	// Sanitize OpenAI compatibility providers: drop entries without base-url
+	cfg.SanitizeOpenAICompatibility()
 
 	// Return the populated configuration struct.
 	return &cfg, nil
 }
 
-// sanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
+// SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
 // not actionable, specifically those missing a BaseURL. It trims whitespace before
 // evaluation and preserves the relative order of remaining entries.
-func sanitizeOpenAICompatibility(cfg *Config) {
+func (cfg *Config) SanitizeOpenAICompatibility() {
 	if cfg == nil || len(cfg.OpenAICompatibility) == 0 {
 		return
 	}
@@ -271,6 +338,7 @@ func sanitizeOpenAICompatibility(cfg *Config) {
 		e := cfg.OpenAICompatibility[i]
 		e.Name = strings.TrimSpace(e.Name)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -280,9 +348,9 @@ func sanitizeOpenAICompatibility(cfg *Config) {
 	cfg.OpenAICompatibility = out
 }
 
-// sanitizeCodexKeys removes Codex API key entries missing a BaseURL.
+// SanitizeCodexKeys removes Codex API key entries missing a BaseURL.
 // It trims whitespace and preserves order for remaining entries.
-func sanitizeCodexKeys(cfg *Config) {
+func (cfg *Config) SanitizeCodexKeys() {
 	if cfg == nil || len(cfg.CodexKey) == 0 {
 		return
 	}
@@ -290,6 +358,7 @@ func sanitizeCodexKeys(cfg *Config) {
 	for i := range cfg.CodexKey {
 		e := cfg.CodexKey[i]
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
 			continue
 		}
@@ -298,7 +367,19 @@ func sanitizeCodexKeys(cfg *Config) {
 	cfg.CodexKey = out
 }
 
-func (cfg *Config) SyncGeminiKeys() {
+// SanitizeClaudeKeys normalizes headers for Claude credentials.
+func (cfg *Config) SanitizeClaudeKeys() {
+	if cfg == nil || len(cfg.ClaudeKey) == 0 {
+		return
+	}
+	for i := range cfg.ClaudeKey {
+		entry := &cfg.ClaudeKey[i]
+		entry.Headers = NormalizeHeaders(entry.Headers)
+	}
+}
+
+// SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
+func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
 	}
@@ -313,7 +394,7 @@ func (cfg *Config) SyncGeminiKeys() {
 		}
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.Headers = normalizeGeminiHeaders(entry.Headers)
+		entry.Headers = NormalizeHeaders(entry.Headers)
 		if _, exists := seen[entry.APIKey]; exists {
 			continue
 		}
@@ -356,7 +437,8 @@ func looksLikeBcrypt(s string) bool {
 	return len(s) > 4 && (s[:4] == "$2a$" || s[:4] == "$2b$" || s[:4] == "$2y$")
 }
 
-func normalizeGeminiHeaders(headers map[string]string) map[string]string {
+// NormalizeHeaders trims header keys and values and removes empty pairs.
+func NormalizeHeaders(headers map[string]string) map[string]string {
 	if len(headers) == 0 {
 		return nil
 	}
@@ -424,6 +506,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	// Remove deprecated auth block before merging to avoid persisting it again.
 	removeMapKey(original.Content[0], "auth")
+	removeLegacyOpenAICompatAPIKeys(original.Content[0])
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
@@ -435,13 +518,19 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	enc := yaml.NewEncoder(f)
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err = enc.Encode(&original); err != nil {
 		_ = enc.Close()
 		return err
 	}
-	return enc.Close()
+	if err = enc.Close(); err != nil {
+		return err
+	}
+	data = NormalizeCommentIndentation(buf.Bytes())
+	_, err = f.Write(data)
+	return err
 }
 
 func sanitizeConfigForPersist(cfg *Config) *Config {
@@ -491,13 +580,40 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	enc := yaml.NewEncoder(f)
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err = enc.Encode(&root); err != nil {
 		_ = enc.Close()
 		return err
 	}
-	return enc.Close()
+	if err = enc.Close(); err != nil {
+		return err
+	}
+	data = NormalizeCommentIndentation(buf.Bytes())
+	_, err = f.Write(data)
+	return err
+}
+
+// NormalizeCommentIndentation removes indentation from standalone YAML comment lines to keep them left aligned.
+func NormalizeCommentIndentation(data []byte) []byte {
+	lines := bytes.Split(data, []byte("\n"))
+	changed := false
+	for i, line := range lines {
+		trimmed := bytes.TrimLeft(line, " \t")
+		if len(trimmed) == 0 || trimmed[0] != '#' {
+			continue
+		}
+		if len(trimmed) == len(line) {
+			continue
+		}
+		lines[i] = append([]byte(nil), trimmed...)
+		changed = true
+	}
+	if !changed {
+		return data
+	}
+	return bytes.Join(lines, []byte("\n"))
 }
 
 // getOrCreateMapValue finds the value node for a given key in a mapping node.
@@ -739,6 +855,7 @@ func matchSequenceElement(original []*yaml.Node, used []bool, target *yaml.Node)
 				}
 			}
 		}
+	default:
 	}
 	// Fallback to structural equality to preserve nodes lacking explicit identifiers.
 	for i := range original {
@@ -842,6 +959,25 @@ func removeMapKey(mapNode *yaml.Node, key string) {
 		if mapNode.Content[i] != nil && mapNode.Content[i].Value == key {
 			mapNode.Content = append(mapNode.Content[:i], mapNode.Content[i+2:]...)
 			return
+		}
+	}
+}
+
+func removeLegacyOpenAICompatAPIKeys(root *yaml.Node) {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return
+	}
+	idx := findMapKeyIndex(root, "openai-compatibility")
+	if idx < 0 || idx+1 >= len(root.Content) {
+		return
+	}
+	seq := root.Content[idx+1]
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return
+	}
+	for i := range seq.Content {
+		if seq.Content[i] != nil && seq.Content[i].Kind == yaml.MappingNode {
+			removeMapKey(seq.Content[i], "api-keys")
 		}
 	}
 }

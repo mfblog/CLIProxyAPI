@@ -88,6 +88,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	body = util.StripThinkingConfigIfUnsupported(req.Model, body)
 	body = fixGeminiImageAspectRatio(req.Model, body)
+	body = applyPayloadConfig(e.cfg, req.Model, body)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -182,6 +183,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	body = util.StripThinkingConfigIfUnsupported(req.Model, body)
 	body = fixGeminiImageAspectRatio(req.Model, body)
+	body = applyPayloadConfig(e.cfg, req.Model, body)
 
 	baseURL := resolveGeminiBaseURL(auth)
 	url := fmt.Sprintf("%s/%s/models/%s:%s", baseURL, glAPIVersion, req.Model, "streamGenerateContent")
@@ -249,16 +251,20 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		buf := make([]byte, 20_971_520)
-		scanner.Buffer(buf, 20_971_520)
+		scanner.Buffer(nil, 20_971_520)
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := parseGeminiStreamUsage(line); ok {
+			filtered := FilterSSEUsageMetadata(line)
+			payload := jsonPayload(filtered)
+			if len(payload) == 0 {
+				continue
+			}
+			if detail, ok := parseGeminiStreamUsage(payload); ok {
 				reporter.publish(ctx, detail)
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(payload), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
 			}
@@ -495,44 +501,11 @@ func resolveGeminiBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func applyGeminiHeaders(req *http.Request, auth *cliproxyauth.Auth) {
-	if req == nil {
-		return
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
 	}
-	headers := geminiCustomHeaders(auth)
-	if len(headers) == 0 {
-		return
-	}
-	for k, v := range headers {
-		if k == "" || v == "" {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-}
-
-func geminiCustomHeaders(auth *cliproxyauth.Auth) map[string]string {
-	if auth == nil || auth.Attributes == nil {
-		return nil
-	}
-	headers := make(map[string]string, len(auth.Attributes))
-	for k, v := range auth.Attributes {
-		if !strings.HasPrefix(k, "header:") {
-			continue
-		}
-		name := strings.TrimSpace(strings.TrimPrefix(k, "header:"))
-		if name == "" {
-			continue
-		}
-		val := strings.TrimSpace(v)
-		if val == "" {
-			continue
-		}
-		headers[name] = val
-	}
-	if len(headers) == 0 {
-		return nil
-	}
-	return headers
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
 }
 
 func fixGeminiImageAspectRatio(modelName string, rawJSON []byte) []byte {

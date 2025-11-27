@@ -62,6 +62,8 @@ type Result struct {
 	Model string
 	// Success marks whether the execution succeeded.
 	Success bool
+	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
+	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
 }
@@ -104,6 +106,10 @@ type Manager struct {
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
+	// Retry controls request retry behavior.
+	requestRetry     atomic.Int32
+	maxRetryInterval atomic.Int64
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -143,6 +149,21 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 	m.mu.Unlock()
 }
 
+// SetRetryConfig updates retry attempts and cooldown wait interval.
+func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration) {
+	if m == nil {
+		return
+	}
+	if retry < 0 {
+		retry = 0
+	}
+	if maxRetryInterval < 0 {
+		maxRetryInterval = 0
+	}
+	m.requestRetry.Store(int32(retry))
+	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if executor == nil {
@@ -169,6 +190,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	auth.EnsureIndex()
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -186,6 +208,11 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, nil
 	}
 	m.mu.Lock()
+	if existing, ok := m.auths[auth.ID]; ok && existing != nil && !auth.indexAssigned && auth.Index == 0 {
+		auth.Index = existing.Index
+		auth.indexAssigned = existing.indexAssigned
+	}
+	auth.EnsureIndex()
 	m.auths[auth.ID] = auth.Clone()
 	m.mu.Unlock()
 	_ = m.persist(ctx, auth)
@@ -209,6 +236,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
 	return nil
@@ -224,13 +252,28 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	rotated := m.rotateProviders(req.Model, normalized)
 	defer m.advanceProviderCursor(req.Model, normalized)
 
+	retryTimes, maxWait := m.retrySettings()
+	attempts := retryTimes + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
 	var lastErr error
-	for _, provider := range rotated {
-		resp, errExec := m.executeWithProvider(ctx, provider, req, opts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
+			return m.executeWithProvider(execCtx, provider, req, opts)
+		})
 		if errExec == nil {
 			return resp, nil
 		}
 		lastErr = errExec
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, req.Model, maxWait)
+		if !shouldRetry {
+			break
+		}
+		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			return cliproxyexecutor.Response{}, errWait
+		}
 	}
 	if lastErr != nil {
 		return cliproxyexecutor.Response{}, lastErr
@@ -248,13 +291,28 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	rotated := m.rotateProviders(req.Model, normalized)
 	defer m.advanceProviderCursor(req.Model, normalized)
 
+	retryTimes, maxWait := m.retrySettings()
+	attempts := retryTimes + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
 	var lastErr error
-	for _, provider := range rotated {
-		resp, errExec := m.executeCountWithProvider(ctx, provider, req, opts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		resp, errExec := m.executeProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (cliproxyexecutor.Response, error) {
+			return m.executeCountWithProvider(execCtx, provider, req, opts)
+		})
 		if errExec == nil {
 			return resp, nil
 		}
 		lastErr = errExec
+		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, attempts, rotated, req.Model, maxWait)
+		if !shouldRetry {
+			break
+		}
+		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			return cliproxyexecutor.Response{}, errWait
+		}
 	}
 	if lastErr != nil {
 		return cliproxyexecutor.Response{}, lastErr
@@ -272,13 +330,28 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	rotated := m.rotateProviders(req.Model, normalized)
 	defer m.advanceProviderCursor(req.Model, normalized)
 
+	retryTimes, maxWait := m.retrySettings()
+	attempts := retryTimes + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
 	var lastErr error
-	for _, provider := range rotated {
-		chunks, errStream := m.executeStreamWithProvider(ctx, provider, req, opts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		chunks, errStream := m.executeStreamProvidersOnce(ctx, rotated, func(execCtx context.Context, provider string) (<-chan cliproxyexecutor.StreamChunk, error) {
+			return m.executeStreamWithProvider(execCtx, provider, req, opts)
+		})
 		if errStream == nil {
 			return chunks, nil
 		}
 		lastErr = errStream
+		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, attempts, rotated, req.Model, maxWait)
+		if !shouldRetry {
+			break
+		}
+		if errWait := waitForCooldown(ctx, wait); errWait != nil {
+			return nil, errWait
+		}
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -321,6 +394,9 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			var se cliproxyexecutor.StatusError
 			if errors.As(errExec, &se) && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
+			}
+			if ra := retryAfterFromError(errExec); ra != nil {
+				result.RetryAfter = ra
 			}
 			m.MarkResult(execCtx, result)
 			lastErr = errExec
@@ -367,6 +443,9 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 			if errors.As(errExec, &se) && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
 			}
+			if ra := retryAfterFromError(errExec); ra != nil {
+				result.RetryAfter = ra
+			}
 			m.MarkResult(execCtx, result)
 			lastErr = errExec
 			continue
@@ -412,6 +491,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 				rerr.HTTPStatus = se.StatusCode()
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: false, Error: rerr}
+			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(execCtx, result)
 			lastErr = errStream
 			continue
@@ -495,6 +575,123 @@ func (m *Manager) advanceProviderCursor(model string, providers []string) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) retrySettings() (int, time.Duration) {
+	if m == nil {
+		return 0, 0
+	}
+	return int(m.requestRetry.Load()), time.Duration(m.maxRetryInterval.Load())
+}
+
+func (m *Manager) closestCooldownWait(providers []string, model string) (time.Duration, bool) {
+	if m == nil || len(providers) == 0 {
+		return 0, false
+	}
+	now := time.Now()
+	providerSet := make(map[string]struct{}, len(providers))
+	for i := range providers {
+		key := strings.TrimSpace(strings.ToLower(providers[i]))
+		if key == "" {
+			continue
+		}
+		providerSet[key] = struct{}{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var (
+		found   bool
+		minWait time.Duration
+	)
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		if !blocked || next.IsZero() || reason == blockReasonDisabled {
+			continue
+		}
+		wait := next.Sub(now)
+		if wait < 0 {
+			continue
+		}
+		if !found || wait < minWait {
+			minWait = wait
+			found = true
+		}
+	}
+	return minWait, found
+}
+
+func (m *Manager) shouldRetryAfterError(err error, attempt, maxAttempts int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
+	if err == nil || attempt >= maxAttempts-1 {
+		return 0, false
+	}
+	if maxWait <= 0 {
+		return 0, false
+	}
+	if status := statusCodeFromError(err); status == http.StatusOK {
+		return 0, false
+	}
+	wait, found := m.closestCooldownWait(providers, model)
+	if !found || wait > maxWait {
+		return 0, false
+	}
+	return wait, true
+}
+
+func waitForCooldown(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) executeProvidersOnce(ctx context.Context, providers []string, fn func(context.Context, string) (cliproxyexecutor.Response, error)) (cliproxyexecutor.Response, error) {
+	if len(providers) == 0 {
+		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var lastErr error
+	for _, provider := range providers {
+		resp, errExec := fn(ctx, provider)
+		if errExec == nil {
+			return resp, nil
+		}
+		lastErr = errExec
+	}
+	if lastErr != nil {
+		return cliproxyexecutor.Response{}, lastErr
+	}
+	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func (m *Manager) executeStreamProvidersOnce(ctx context.Context, providers []string, fn func(context.Context, string) (<-chan cliproxyexecutor.StreamChunk, error)) (<-chan cliproxyexecutor.StreamChunk, error) {
+	if len(providers) == 0 {
+		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+	var lastErr error
+	for _, provider := range providers {
+		chunks, errExec := fn(ctx, provider)
+		if errExec == nil {
+			return chunks, nil
+		}
+		lastErr = errExec
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -552,18 +749,29 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
 					shouldSuspendModel = true
+				case 404:
+					next := now.Add(12 * time.Hour)
+					state.NextRetryAfter = next
+					suspendReason = "not_found"
+					shouldSuspendModel = true
 				case 429:
-					cooldown, nextLevel := nextQuotaCooldown(state.Quota.BackoffLevel)
 					var next time.Time
-					if cooldown > 0 {
-						next = now.Add(cooldown)
+					backoffLevel := state.Quota.BackoffLevel
+					if result.RetryAfter != nil {
+						next = now.Add(*result.RetryAfter)
+					} else {
+						cooldown, nextLevel := nextQuotaCooldown(backoffLevel)
+						if cooldown > 0 {
+							next = now.Add(cooldown)
+						}
+						backoffLevel = nextLevel
 					}
 					state.NextRetryAfter = next
 					state.Quota = QuotaState{
 						Exceeded:      true,
 						Reason:        "quota",
 						NextRecoverAt: next,
-						BackoffLevel:  nextLevel,
+						BackoffLevel:  backoffLevel,
 					}
 					suspendReason = "quota"
 					shouldSuspendModel = true
@@ -579,7 +787,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
 			} else {
-				applyAuthFailureState(auth, result.Error, now)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
 		}
 
@@ -739,6 +947,39 @@ func cloneError(err *Error) *Error {
 	}
 }
 
+func statusCodeFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	var sc statusCoder
+	if errors.As(err, &sc) && sc != nil {
+		return sc.StatusCode()
+	}
+	return 0
+}
+
+func retryAfterFromError(err error) *time.Duration {
+	if err == nil {
+		return nil
+	}
+	type retryAfterProvider interface {
+		RetryAfter() *time.Duration
+	}
+	rap, ok := err.(retryAfterProvider)
+	if !ok || rap == nil {
+		return nil
+	}
+	retryAfter := rap.RetryAfter()
+	if retryAfter == nil {
+		return nil
+	}
+	val := *retryAfter
+	return &val
+}
+
 func statusCodeFromResult(err *Error) int {
 	if err == nil {
 		return 0
@@ -746,7 +987,7 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, now time.Time) {
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
 	if auth == nil {
 		return
 	}
@@ -767,17 +1008,24 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, now time.Time) {
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
+	case 404:
+		auth.StatusMessage = "not_found"
+		auth.NextRetryAfter = now.Add(12 * time.Hour)
 	case 429:
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
-		cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel)
 		var next time.Time
-		if cooldown > 0 {
-			next = now.Add(cooldown)
+		if retryAfter != nil {
+			next = now.Add(*retryAfter)
+		} else {
+			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel)
+			if cooldown > 0 {
+				next = now.Add(cooldown)
+			}
+			auth.Quota.BackoffLevel = nextLevel
 		}
 		auth.Quota.NextRecoverAt = next
-		auth.Quota.BackoffLevel = nextLevel
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
